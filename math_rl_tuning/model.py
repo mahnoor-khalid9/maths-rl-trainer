@@ -1,0 +1,384 @@
+"""
+Model loading, quantization, and LoRA adapter setup.
+
+Supports two backends:
+  - Standard HuggingFace (transformers + peft + bitsandbytes)
+  - Unsloth / FastLanguageModel (for GRPO with vLLM acceleration)
+"""
+
+import os
+import json
+import torch
+from typing import Optional, Tuple
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import (
+    LoraConfig,
+    PeftModel,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
+
+from math_rl_tuning.config import Config
+
+# Fix transformers 4.47+/5.x bug: _set_model_specific_special_tokens receives a list
+# from saved Qwen tokenizer configs instead of the expected dict.
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase as _PTB
+_orig_set_special = _PTB._set_model_specific_special_tokens
+def _patched_set_special(self, special_tokens):
+    if not isinstance(special_tokens, dict):
+        return
+    return _orig_set_special(self, special_tokens)
+_PTB._set_model_specific_special_tokens = _patched_set_special
+
+
+# ---------------------------------------------------------------------------
+# BitsAndBytes quantization config builder
+# ---------------------------------------------------------------------------
+
+_DTYPE_MAP = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
+
+def build_bnb_config(cfg: Config) -> BitsAndBytesConfig:
+    """
+    Create a BitsAndBytesConfig from the project config.
+
+    The compute dtype is aligned with the GPU's precision capability:
+    bfloat16 on Ampere+ GPUs, float16 otherwise.  This prevents the
+    fp16 GradScaler from encountering bfloat16 tensors.
+    """
+    from math_rl_tuning.utils import is_bf16_supported
+
+    qc = cfg.quantization
+    # Auto-align compute dtype with GPU capability
+    if qc.bnb_4bit_compute_dtype == "auto" or qc.bnb_4bit_compute_dtype == "bfloat16":
+        compute_dtype = torch.bfloat16 if is_bf16_supported() else torch.float16
+    else:
+        compute_dtype = _DTYPE_MAP.get(qc.bnb_4bit_compute_dtype, torch.float16)
+
+    print(f"BnB compute dtype: {compute_dtype}")
+    return BitsAndBytesConfig(
+        load_in_4bit=qc.load_in_4bit,
+        bnb_4bit_quant_type=qc.bnb_4bit_quant_type,
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=qc.bnb_4bit_use_double_quant,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LoRA config builder
+# ---------------------------------------------------------------------------
+
+def build_lora_config(cfg: Config, stage: str = "sft") -> LoraConfig:
+    """
+    Build a PEFT LoraConfig for the given *stage* ('sft' or 'grpo').
+    """
+    lc = getattr(cfg.lora, stage)
+    return LoraConfig(
+        r=lc.r,
+        lora_alpha=lc.alpha,
+        lora_dropout=lc.dropout,
+        bias=lc.bias,
+        task_type=lc.task_type,
+        target_modules=lc.target_modules,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Standard HF model loading (for SFT)
+# ---------------------------------------------------------------------------
+
+def load_model_and_tokenizer(
+    cfg: Config,
+    stage: str = "sft",
+    inference: bool = False,
+    model_path: Optional[str] = None,
+) -> Tuple:
+    """
+    Load base model with QLoRA quantization and attach a LoRA adapter.
+
+    Args:
+        cfg: Project configuration.
+        stage: 'sft' or 'grpo' — selects the LoRA config.
+        inference: If True, skip LoRA wrapping (for loading a saved adapter later).
+        model_path: Override the model name/path. Defaults to ``cfg.model.name``.
+                    Use this to load a merged model for GRPO.
+
+    Returns:
+        (model, tokenizer)
+    """
+    mc = cfg.model
+    name_or_path = model_path or mc.name
+
+    print(f"Loading tokenizer: {name_or_path}")
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path)
+
+    # Ensure pad token exists — use eos_token, do NOT add a new token.
+    # Adding [PAD] resizes embeddings and the new row is randomly
+    # initialized, which causes CUDA asserts when used for padding.
+    if tokenizer.pad_token is None:
+        # Use EOS as PAD rather than adding a new [PAD] token.
+        # Adding a new token resizes the embedding table and the new row is
+        # randomly initialized — this causes CUDA asserts and unstable training.
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load model with 4-bit NF4 quantization (QLoRA).
+    # This reduces VRAM from ~14GB (fp16) to ~4GB, making 7B training feasible on a single GPU.
+    bnb_config = build_bnb_config(cfg)
+
+    print(f"Loading model: {name_or_path} (4-bit quantized)")
+    model = AutoModelForCausalLM.from_pretrained(
+        name_or_path,
+        quantization_config=bnb_config,
+        device_map="auto",
+        use_cache=inference,  # KV-cache speeds up inference but wastes VRAM during training
+        attn_implementation="sdpa",  # PyTorch 2.0+ built-in flash-style attention, no extra install
+    )
+
+    # Resize embeddings if we added tokens
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    if not inference:
+        # prepare_model_for_kbit_training unfreezes layer norms and casts them to fp32
+        # (quantized models freeze everything by default — this makes them trainable again).
+        model = prepare_model_for_kbit_training(model)
+
+        # Attach LoRA adapter — only the low-rank matrices are trainable (~1-2% of params).
+        lora_config = build_lora_config(cfg, stage=stage)
+        model = get_peft_model(model, lora_config)
+
+        # Gradient checkpointing recomputes activations during backward pass
+        # instead of storing them, cutting VRAM usage at the cost of extra compute.
+        model.gradient_checkpointing_enable()
+        model.print_trainable_parameters()
+
+    return model, tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Load a saved LoRA adapter onto the base model (for inference / evaluation)
+# ---------------------------------------------------------------------------
+
+def load_adapter(
+    cfg: Config,
+    adapter_path: str,
+    base_model_name: Optional[str] = None,
+    load_in_4bit: bool = True,
+) -> Tuple:
+    """
+    Load a base model + a saved LoRA adapter for inference.
+
+    Returns (model, tokenizer).
+    """
+    base_name = base_model_name or cfg.model.name
+
+    tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    bnb_config = build_bnb_config(cfg) if load_in_4bit else None
+
+    print(f"Loading base model: {base_name}")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_name,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.float16 if not load_in_4bit else None,
+    )
+
+    # Resize to match adapter tokenizer
+    base_model.resize_token_embeddings(len(tokenizer))
+
+    print(f"Loading adapter: {adapter_path}")
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+    model.eval()
+
+    return model, tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Merge LoRA adapter into base model (needed before GRPO with Unsloth)
+# ---------------------------------------------------------------------------
+
+def merge_adapter(
+    cfg: Config,
+    adapter_path: str,
+    save_path: Optional[str] = None,
+) -> str:
+    """
+    Merge a LoRA adapter into the base model weights and save the result.
+
+    This is required before GRPO training with Unsloth/vLLM because they
+    need a clean model (no adapter mismatch).
+
+    Args:
+        cfg: Project configuration.
+        adapter_path: Path to the saved LoRA adapter.
+        save_path: Where to save the merged model. Defaults to
+                   ``cfg.paths.sft_merged_dir``.
+
+    Returns:
+        The path where the merged model was saved.
+    """
+    save_path = save_path or cfg.paths.sft_merged_dir
+
+    if os.path.exists(save_path) and os.listdir(save_path):
+        print(f"Merged model already exists at {save_path} — skipping.")
+        return save_path
+
+    # Validate adapter path before expensive model loading
+    adapter_config = os.path.join(adapter_path, "adapter_config.json")
+    if not os.path.isdir(adapter_path):
+        raise FileNotFoundError(
+            f"SFT adapter directory not found: {adapter_path}\n"
+            f"Make sure you ran SFT training (notebook 01) and the adapter "
+            f"was saved/copied to this path."
+        )
+    if not os.path.isfile(adapter_config):
+        contents = os.listdir(adapter_path) if os.path.isdir(adapter_path) else []
+        raise FileNotFoundError(
+            f"No adapter_config.json in {adapter_path}\n"
+            f"Directory contains: {contents}\n"
+            f"This doesn't look like a valid LoRA adapter directory."
+        )
+
+    # Merge is needed because Unsloth's FastLanguageModel can only load clean,
+    # non-PEFT models. We bake the LoRA weights into the base model first,
+    # then load the merged result for GRPO.
+    print("Merging SFT adapter into base model...")
+    base_name = cfg.model.name
+
+    # Load tokenizer — try adapter first, fall back to base model.
+    # The SFT adapter may have added [PAD] (vocab 32001). We MUST match
+    # that vocab size here so PeftModel.from_pretrained doesn't fail on
+    # a lm_head dimension mismatch.
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+    except (ValueError, OSError):
+        print(f"  Could not load tokenizer from adapter, using base model")
+        tokenizer = AutoTokenizer.from_pretrained(base_name)
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    vocab_size = len(tokenizer)
+
+    # Load base model in fp16 for accurate merging
+    print(f"  Loading base model: {base_name}")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_name,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+
+    print(f"  Resizing embeddings to {vocab_size}...")
+    base_model.resize_token_embeddings(vocab_size)
+
+    print(f"  Loading adapter from {adapter_path}...")
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+
+    print("  Merging weights...")
+    model = model.merge_and_unload()
+
+    os.makedirs(save_path, exist_ok=True)
+    print(f"  Saving merged model to {save_path}...")
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+
+    # Cleanup
+    del model, base_model
+    torch.cuda.empty_cache()
+
+    print("  Merge complete.")
+    return save_path
+
+
+# ---------------------------------------------------------------------------
+# Unsloth model loading (for GRPO)
+# ---------------------------------------------------------------------------
+
+def load_unsloth_model(
+    cfg: Config,
+    model_path: str,
+    for_training: bool = True,
+    max_seq_length: Optional[int] = None,
+) -> Tuple:
+    """
+    Load a model using Unsloth's FastLanguageModel for GRPO training
+    with vLLM acceleration.
+
+    Args:
+        cfg: Project configuration.
+        model_path: Path to the merged model (or HF model name).
+        for_training: If True, attach a fresh LoRA adapter for RL.
+
+    Returns:
+        (model, tokenizer)
+    """
+    from unsloth import FastLanguageModel
+
+    lc = cfg.lora.grpo
+
+    seq_len = max_seq_length or cfg.model.max_seq_length
+
+    print(f"Loading model with Unsloth: {model_path}")
+    print(f"  max_seq_length = {seq_len}")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_path,
+        max_seq_length=seq_len,
+        dtype=None,
+        load_in_4bit=True,
+    )
+
+    if for_training:
+        print("Attaching fresh LoRA adapter for RL...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lc.r,
+            target_modules=lc.target_modules if isinstance(lc.target_modules, list)
+                else [lc.target_modules],
+            lora_alpha=lc.alpha,
+            lora_dropout=lc.dropout,
+            bias=lc.bias,
+            use_gradient_checkpointing="unsloth",
+            random_state=3407,
+        )
+
+    return model, tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Vocab size hotfix (for Unsloth config.json mismatch)
+# ---------------------------------------------------------------------------
+
+def patch_vocab_size(model_path: str):
+    """
+    Patch config.json so vocab_size matches the actual tokenizer size.
+
+    After merging adapters with added tokens (e.g. [PAD]), the saved
+    config.json may still have the original vocab_size.  This causes
+    CUDA device-side asserts when generation produces token IDs that
+    exceed the embedding table size.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        print(f"  config.json not found at {model_path} — skipping patch.")
+        return
+
+    # Read actual tokenizer size as the source of truth
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    actual_vocab = len(tokenizer)
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    if config.get("vocab_size") != actual_vocab:
+        print(f"  Patching vocab_size: {config.get('vocab_size')} -> {actual_vocab}")
+        config["vocab_size"] = actual_vocab
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+    else:
+        print(f"  vocab_size already correct ({actual_vocab}).")

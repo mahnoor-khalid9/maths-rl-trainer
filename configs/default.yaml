@@ -1,0 +1,159 @@
+
+
+# models saved in google drive
+paths:
+  sft_output_dir: "./outputs/sft"
+  sft_merged_dir: "./outputs/sft_merged"
+  grpo_output_dir: "./outputs/grpo"
+  eval_output_dir: "./outputs/eval"
+  drive_mount: "/content/drive"
+  drive_save_dir: "/content/drive/MyDrive/math-rl-tuning"
+
+model:
+  name: "Qwen/Qwen2.5-Math-7B"
+  max_seq_length: 2048
+
+# quantization to speed up training and reduce GPU usage since compute is a bottleneck in this project
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_use_double_quant: true
+
+#lora config since full fine-tuning is unecessary and expensive. lets us train far less parameters and still be accurace
+lora:
+  sft:
+    r: 32
+    alpha: 64
+    dropout: 0.0
+    bias: "none"
+    task_type: "CAUSAL_LM"
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+  grpo:
+    r: 32
+    alpha: 32
+    dropout: 0.0
+    bias: "none"
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+
+dataset:
+  # sub datasets used from full math dataset
+  name: "AI-MO/NuminaMath-CoT"
+  sft_keep_sources:
+    - "gsm8k"
+    - "math"
+    - "cn_k12"
+    - "orca_math"
+    - "synthetic_math"
+    - "olympiads"
+    - "aops_forum"
+    - "amc_aime"
+  test_drop_sources:
+    - "synthetic_math"
+    - "synthetic_amc"
+  train_per_source: 12000
+  train_per_source_overrides: {}
+  val_per_source: 500
+  random_state: 42
+  #simple consistent prompt used here for this prompt, prioritizes always having boxed for consistent answers
+  system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
+
+sft_training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: false
+  # fp16/bf16: leave both false to auto-detect based on GPU capability
+  fp16: false
+  bf16: false
+  learning_rate: 2.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  logging_steps: 25
+  eval_strategy: "steps"
+  eval_steps: 500
+  neftune_noise_alpha: null
+  max_length: 2048
+  dataset_text_field: "messages"
+  completion_only_loss: true
+  packing: true
+  dataset_num_proc: 24
+  report_to: "wandb"
+  wandb_project: "AI-MONuminaMath"
+  save_strategy: "steps"
+  save_steps: 500
+  save_total_limit: 3
+  early_stopping_patience: 3
+
+grpo_training:
+  learning_rate: 5.0e-6
+  adam_beta1: 0.9
+  adam_beta2: 0.99
+  warmup_ratio: 0.1
+  weight_decay: 0.1
+  lr_scheduler_type: "cosine"
+  optim: "adamw_torch_fused"
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  num_generations: 8
+  max_prompt_length: 256
+  max_completion_length: 1024
+  num_train_epochs: 1
+  report_to: "none"
+  beta: 0.04
+  grpo_sample_size: 5000
+  max_grad_norm: 0.1
+  logging_steps: 1
+  save_strategy: "steps"
+  save_steps: 50
+  save_total_limit: 3
+  use_vllm: true
+  vllm_mode: "colocate"
+  vllm_gpu_memory_utilization: 0.25
+  vllm_enable_sleep_mode: false
+  vllm_max_model_length: 2048
+
+rewards:
+  # points for correct answer (positive signal)
+  correct_bonus: 3.0
+  # penalty for wrong answer (negative signal)
+  incorrect_penalty: -1.0
+  # has boxed
+  format_bonus: 0.5
+  # does not have boxed
+  format_penalty: -0.5
+  # boxed is very last thing to avoid very long prompts (juan scenario)
+  strict_format_bonus: 0.5
+
+# --- Evaluation ---
+evaluation:
+  num_samples: 300
+  max_new_tokens: 2048
+  system_prompt: "Please reason step by step, and put your final answer within \\boxed{}."
+  batch_size: 16
+  eval_keep_sources:
+    - "gsm8k"
+    - "math"
+    - "cn_k12"
+    - "orca_math"
+    - "synthetic_math"
+    - "olympiads"
+    - "aops_forum"
+    - "amc_aime"
+

@@ -1,0 +1,7 @@
+# MANIFEST.in tells setuptools which non-Python files to include in source distributions.
+# Without these, `pip install` from a tarball would miss the configs and notebooks.
+
+include configs/*.yaml        # Default configuration (required at runtime — the package loads it)
+include README.md             # Project documentation
+include LICENSE
+recursive-include notebooks *.ipynb  # Colab training notebooks
